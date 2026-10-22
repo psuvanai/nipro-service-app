@@ -19,18 +19,21 @@ import sys
 import time
 import traceback
 import uuid
+import zipfile
 from collections import defaultdict
 from contextlib import contextmanager
-from copy import copy
 from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+from lxml import etree
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
-from openpyxl.utils.datetime import from_excel
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils.datetime import from_excel, to_excel
 from PIL import Image, ImageOps, ImageSequence
 
 try:
@@ -64,9 +67,10 @@ PDF_ZOOM = 2.5
 MAX_SIDE = 2200
 JPEG_QUALITY = 88
 
-CONDITION_OPTIONS = ["Warranty", "PM Contract", "Other"]
+CONDITION_OPTIONS = ["Warranty", "PM Contract", "Fixed asset", "Work Order", "Other"]
 KIND_OPTIONS = ["PM", "Service", "Installation"]
-STATUS_OPTIONS = ["C", "W", "S", "T", "N/A"]
+STATUS_OPTIONS = ["Issue DO", "Issue PM", "C", "W", "S", "T", "N/A"]
+SERVICE_TYPE_OPTIONS = ["Warranty", "PM Contract"]
 PLACEHOLDERS = {"office", "-", "n/a", "na"}
 
 REPORT_COLS = [
@@ -232,6 +236,10 @@ def map_condition(text: Any) -> str:
         return "Warranty"
     if "contract" in k:
         return "PM Contract"
+    if "fixed" in k:
+        return "Fixed asset"
+    if "work order" in k:
+        return "Work Order"
     return "Other" if k else ""
 
 
@@ -337,7 +345,7 @@ class Reference:
     @classmethod
     def from_bytes(cls, data: bytes) -> "Reference":
         ref = cls()
-        wb = load_workbook(io.BytesIO(data), data_only=True)
+        wb = load_workbook(io.BytesIO(data), data_only=True, keep_links=False)
         ref.missing_sheets = [n for n in REQUIRED_SHEETS if get_sheet(wb, n) is None]
 
         ws = get_sheet(wb, SHEET_ERR)
@@ -973,16 +981,9 @@ def display_name(r: dict, lang: str) -> str:
     return (eng or cu or th) if lang == "ENG" else (th or cu or eng)
 
 
-def compute_service_type(kind: str, d: Optional[date], start: Optional[dtime], valid: list[str]) -> str:
-    base = {"PM": "PM", "Installation": "Installation"}.get(kind, "Urgent call")
-    cand = base
-    if d is not None and d.weekday() >= 5:
-        cand = f"{base} (SAT-SUN)"
-    elif start is not None and start >= dtime(18, 0):
-        cand = f"{base} (after 18.00)"
-    if valid and cand not in valid:
-        cand = base
-    return cand
+# ค่าที่ใช้ในชีต SN tracking form (ตามถ้อยคำของแถวเดิมและตารางสรุป)
+SN_COND = {"Warranty": "Warranty", "PM Contract": "Contract", "Fixed asset": "Fixed asset", "Work Order": "Work Order"}
+SN_KIND = {"PM": "PM", "Service": "Service", "Installation": "Installation"}
 
 
 def build_sn_rows(reports: pd.DataFrame, parts: pd.DataFrame, ref: Optional[Reference], opts: dict) -> list[dict]:
@@ -993,49 +994,45 @@ def build_sn_rows(reports: pd.DataFrame, parts: pd.DataFrame, ref: Optional[Refe
         for p in parts.to_dict("records"):
             if not is_blank(p.get("part_code")) or not is_blank(p.get("part_name")):
                 pmap[norm_text(p.get("rid"))].append(p)
-    valid_cond = ref.conditions if ref and ref.conditions else ["Warranty", "PM Contract"]
     rows: list[dict] = []
     for r in recs:
         d = parse_date(r.get("date"))
-        start = parse_time(r.get("start_time"))
         serials = split_list(r.get("serials")) or [""]
         errors = [e for e in split_list(r.get("error_codes")) if not is_na(e)]
         plist = pmap.get(norm_text(r.get("rid")), [])
-        cond = norm_text(r.get("condition"))
-        cond_out = cond if cond in valid_cond else ""
-        stype = compute_service_type(norm_text(r.get("service_kind")), d, start, ref.service_types if ref else [])
+        kind = norm_text(r.get("service_kind")) or "Service"
+        stype = SN_KIND.get(kind, "Service")
+        cond_out = SN_COND.get(norm_text(r.get("condition")), "")
+        details = norm_text(r.get("description")) or ("PM" if kind == "PM" else "")
+        quotation = norm_text(r.get("quotation_no")) or "-"
         for si, sn in enumerate(serials):
             machine = ref.match_serial(sn) if (ref and sn) else None
             n = max(len(errors), len(plist), 1) if si == 0 else 1
             for i in range(n):
-                ecode, edesc = "N/A", "-"
                 if si == 0 and i < len(errors):
-                    ecode = errors[i]
+                    ecode, edesc = errors[i], ""
                     if ref:
                         s_, canon, desc = ref.check_error(ecode)
                         if s_ == "OK":
                             ecode, edesc = canon, desc
-                        else:
-                            edesc = ""
-                    else:
-                        edesc = ""
-                pcode, pdesc, qty, unit, cons = "N/A", "-", None, "", ""
+                else:
+                    ecode, edesc = ("PM", "-") if kind == "PM" else ("N/A", "-")
+                pcode, pdesc, qty, unit, cons = "N/A", "-", "-", "", "-"
                 if si == 0 and i < len(plist):
                     p = plist[i]
                     pcode, pname = norm_text(p.get("part_code")), norm_text(p.get("part_name"))
-                    pdesc = pname
+                    pdesc = pname or "-"
                     if ref and pcode:
                         s_, canon, desc = ref.check_part(pcode, pname)
                         if s_ == "OK":
                             pcode, pdesc = canon, desc
                     pcode = pcode or "N/A"
-                    qty = to_float(p.get("qty"), 1.0)
-                    unit, cons = norm_text(p.get("unit")), norm_text(p.get("consignment_no"))
-                status = norm_text(r.get("status_code"))
-                if not status:
-                    status = ("T" if cons else "W") if pcode != "N/A" else "N/A"
+                    q = to_float(p.get("qty"), 1.0)
+                    qty = int(q) if q is not None and float(q).is_integer() else q
+                    unit = norm_text(p.get("unit"))
+                    cons = norm_text(p.get("consignment_no")) or "-"
                 contract = start_c = end_c = freq = ""
-                if cond == "PM Contract" and machine:
+                if machine:
                     contract = machine.get("contract_no") or ""
                     start_c, end_c = parse_date(machine.get("pm_start")), parse_date(machine.get("pm_end"))
                     cnt = to_float(machine.get("pm_count"))
@@ -1047,9 +1044,8 @@ def build_sn_rows(reports: pd.DataFrame, parts: pd.DataFrame, ref: Optional[Refe
                     "model": norm_text(r.get("model")) or (machine.get("model") if machine else ""),
                     "serial": sn, "condition": cond_out, "service_type": stype,
                     "error_code": ecode, "error_desc": edesc, "part_code": pcode, "part_desc": pdesc,
-                    "qty": (int(qty) if qty is not None and float(qty).is_integer() else qty),
-                    "unit": unit, "consignment": cons, "quotation": norm_text(r.get("quotation_no")),
-                    "details": norm_text(r.get("description")), "status": status,
+                    "qty": qty, "unit": unit, "consignment": cons, "quotation": quotation,
+                    "details": details, "status": norm_text(r.get("status_code")),
                     "contract_no": contract, "start_contract": start_c, "end_contract": end_c, "freq": freq,
                     "customer": (machine.get("name_th") if machine and machine.get("name_th") else norm_text(r.get("customer"))),
                     "remark": norm_text(r.get("remark")),
@@ -1114,8 +1110,27 @@ def build_expense_df(reports: pd.DataFrame, saved: pd.DataFrame, lang: str) -> p
 
 
 # ----------------------------------------------------------------------------
-# Excel writing (openpyxl: keeps formulas / layout / formatting)
+# Excel writing: openpyxl is used ONLY to read/locate. The file itself is patched at XML level,
+# so external links, shapes, styles and every untouched sheet stay byte-identical.
 # ----------------------------------------------------------------------------
+class Recorder:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.cells: dict = defaultdict(list)     # sheet -> [(row, col, value)]
+        self.formulas: dict = defaultdict(list)  # sheet -> [(row, col, formula_without_equals)]
+        self.styles: dict = defaultdict(list)    # sheet -> [(src_row, dst_row, ncols)]
+
+    def edits(self) -> dict:
+        names = set(self.cells) | set(self.formulas) | set(self.styles)
+        return {n: {"cells": self.cells.get(n, []), "formulas": self.formulas.get(n, []),
+                    "styles": self.styles.get(n, [])} for n in names}
+
+
+REC = Recorder()
+
+
 def row_values(ws, r: int) -> tuple:
     if r < 1 or r > ws.max_row:
         return ()
@@ -1155,7 +1170,8 @@ def locate_cols(ws, header_rows: tuple, spec: dict, log: list, sheet: str) -> di
 
 
 def set_cell(ws, row: int, col: int, value: Any, overwrite: bool = False,
-             allow_placeholder: bool = False, number_format: Optional[str] = None) -> str:
+             allow_placeholder: bool = False) -> str:
+    """Plan a write (kept in memory + recorded). Never touches formulas."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return "empty"
     cell = ws.cell(row=row, column=col)
@@ -1168,20 +1184,8 @@ def set_cell(ws, row: int, col: int, value: Any, overwrite: bool = False,
         if not (allow_placeholder and norm_key(cur) in PLACEHOLDERS):
             return "occupied"
     cell.value = value
-    if number_format and cell.number_format == "General":
-        cell.number_format = number_format
+    REC.cells[ws.title].append((row, col, value))
     return "written"
-
-
-def ensure_row_style(ws, src_row: int, dst_row: int) -> None:
-    if src_row == dst_row:
-        return
-    for c in range(1, ws.max_column + 1):
-        src, dst = ws.cell(src_row, c), ws.cell(dst_row, c)
-        if isinstance(src, MergedCell) or isinstance(dst, MergedCell):
-            continue
-        if src.has_style and not dst.has_style:
-            dst._style = copy(src._style)
 
 
 def _cached(wsv, r: int, c: int) -> Any:
@@ -1294,6 +1298,8 @@ def fill_sn(ws, rows: list[dict], opts: dict, log: list) -> int:
         raise ValueError("ไม่พบหัวตาราง 'Person in charge (ENG)' ในชีต SN tracking form")
     cols = locate_cols(ws, (hdr, hdr + 1), SN_SPEC, log, SHEET_SN)
     first = hdr + 2 if "(only name)" in norm_key(ws.cell(hdr + 1, 1).value) else hdr + 1
+    ncols = max(cols.values())
+    limit = min(ws.max_row, first + 3000)
 
     def used(r: int) -> bool:
         for k in ("date", "hospital", "serial", "model"):
@@ -1302,22 +1308,63 @@ def fill_sn(ws, rows: list[dict], opts: dict, log: list) -> int:
                 return True
         return False
 
-    r, written, ow = first, 0, opts.get("overwrite", False)
-    for rec in rows:
-        limit = r + 5000
-        while used(r) and r < limit:
-            r += 1
-        ensure_row_style(ws, first, r)
-        for key, val in rec.items():
-            if key not in cols:
+    # 1) หาตารางสรุป (Warranty / Contract / Work Order / Fixed asset) ที่อยู่ใต้ข้อมูล
+    stop = None
+    for r in range(first, limit + 1):
+        if any(norm_key(ws.cell(r, cols[k]).value) == "warranty" for k in ("model", "hospital", "date")):
+            stop = r
+            break
+    end = (stop - 1) if stop else limit
+    last_used = first - 1
+    for r in range(first, end + 1):
+        if used(r):
+            last_used = r
+    tmpl = last_used if last_used >= first else first
+
+    # 2) แถวว่างที่เขียนได้ = ต่อจากแถวข้อมูลสุดท้าย จนถึงก่อนตารางสรุป
+    if stop:
+        free = list(range(last_used + 1, stop))
+    else:
+        free = list(range(last_used + 1, last_used + 1 + len(rows)))
+    if len(rows) > len(free):
+        raise ValueError(
+            f"ชีต SN tracking form มีแถวว่างก่อนตารางสรุป (แถว {stop}) เหลือ {len(free)} แถว แต่ต้องใช้ {len(rows)} แถว "
+            f"กรุณาเปิดไฟล์ Master ใน Excel แล้วแทรกแถวว่างเพิ่มอย่างน้อย {len(rows) - len(free)} แถว "
+            f"โดยแทรกไว้ 'กลาง' ช่วงข้อมูล (เช่น คลิกขวาที่แถวสุดท้ายของข้อมูล > Insert) เพื่อให้สูตรสรุปขยายตาม "
+            f"แล้วอัปโหลด Master ใหม่"
+        )
+
+    # 3) คอลัมน์ที่แถวต้นแบบเป็นสูตร -> คัดลอกสูตรไปแถวใหม่ ไม่เขียนค่าทับ
+    tf: dict[int, str] = {}
+    for c in range(1, ncols + 1):
+        v = ws.cell(tmpl, c).value
+        if isinstance(v, str) and v.startswith("="):
+            tf[c] = v
+
+    written = 0
+    for rec, r in zip(rows, free):
+        REC.styles[ws.title].append((tmpl, r, ncols))
+        for c, f in tf.items():
+            try:
+                nf = Translator(f, origin=f"{get_column_letter(c)}{tmpl}").translate_formula(f"{get_column_letter(c)}{r}")
+            except Exception as e:
+                log.append({"sheet": SHEET_SN, "item": f"row {r} / col {c}", "result": f"formula copy failed: {e}"})
                 continue
-            fmt = "dd/mm/yyyy" if key in ("date", "start_contract", "end_contract") else None
-            res = set_cell(ws, r, cols[key], val, ow, number_format=fmt)
+            REC.formulas[ws.title].append((r, c, nf[1:]))
+            written += 1
+        for key, val in rec.items():
+            col = cols.get(key)
+            if col is None or col in tf:
+                continue
+            res = set_cell(ws, r, col, val, True)
             if res == "written":
                 written += 1
             elif res not in ("empty", "occupied"):
                 log.append({"sheet": SHEET_SN, "item": f"row {r} / {key}", "result": res})
-        r += 1
+    letters = ", ".join(get_column_letter(c) for c in sorted(tf)) or "-"
+    log.append({"sheet": SHEET_SN, "item": "layout",
+                "result": f"แถวต้นแบบ {tmpl}; เขียนแถว {free[0] if free else '-'}-{free[len(rows) - 1] if rows else '-'}; "
+                          f"ตารางสรุปเริ่มแถว {stop or '-'}; คัดลอกสูตรคอลัมน์ {letters}"})
     return written
 
 
@@ -1374,12 +1421,170 @@ def fill_expense(ws, wsv, exp_df: pd.DataFrame, base_hint: Optional[date], opts:
     return written
 
 
+# ---- XML-level patcher ------------------------------------------------------
+_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_RNS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+
+def _q(tag: str) -> str:
+    return f"{{{_NS}}}{tag}"
+
+
+def _sheet_paths(zf: zipfile.ZipFile) -> dict[str, str]:
+    wbx = etree.fromstring(zf.read("xl/workbook.xml"))
+    rels = etree.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    rid_target = {r.get("Id"): (r.get("Target") or "") for r in rels}
+    out: dict[str, str] = {}
+    sheets = wbx.find(_q("sheets"))
+    for s in (sheets if sheets is not None else []):
+        t = rid_target.get(s.get(f"{{{_RNS}}}id"), "").lstrip("/")
+        out[norm_key(s.get("name"))] = t if t.startswith("xl/") else "xl/" + t
+    return out
+
+
+def _xml_value(v: Any) -> tuple[str, str]:
+    if isinstance(v, bool):
+        return "b", "1" if v else "0"
+    if isinstance(v, (datetime, date, dtime)):
+        return "n", repr(float(to_excel(v)))
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+            return "s", ""
+        return "n", repr(v)
+    return "s", str(v)
+
+
+def _patch_sheet(xml: bytes, cells: list, formulas: list, styles: list) -> bytes:
+    root = etree.fromstring(xml)
+    sd = root.find(_q("sheetData"))
+    if sd is None:
+        raise ValueError("ไม่พบ sheetData ในชีต")
+    rows = {int(r.get("r")): r for r in sd.findall(_q("row")) if r.get("r")}
+
+    def get_row(n: int):
+        row = rows.get(n)
+        if row is not None:
+            row.attrib.pop("spans", None)
+            return row
+        row = etree.Element(_q("row"))
+        row.set("r", str(n))
+        later = [k for k in rows if k > n]
+        if later:
+            rows[min(later)].addprevious(row)
+        else:
+            sd.append(row)
+        rows[n] = row
+        return row
+
+    def peek(n: int, c: int):
+        row = rows.get(n)
+        if row is None:
+            return None
+        ref = f"{get_column_letter(c)}{n}"
+        for ce in row.findall(_q("c")):
+            if ce.get("r") == ref:
+                return ce
+        return None
+
+    def get_cell(n: int, c: int):
+        found = peek(n, c)
+        if found is not None:
+            return found
+        row = get_row(n)
+        new = etree.Element(_q("c"))
+        new.set("r", f"{get_column_letter(c)}{n}")
+        for ce in row.findall(_q("c")):
+            m = re.match(r"[A-Z]+", ce.get("r") or "")
+            if m and column_index_from_string(m.group(0)) > c:
+                ce.addprevious(new)
+                return new
+        row.append(new)
+        return new
+
+    def reset(ce) -> None:
+        for ch in list(ce):
+            ce.remove(ch)
+        ce.attrib.pop("t", None)
+
+    for src_r, dst_r, ncols in styles:          # 1) รูปแบบ (เส้นขอบ/รูปแบบวันที่) จากแถวต้นแบบ
+        for c in range(1, ncols + 1):
+            src = peek(src_r, c)
+            dst = get_cell(dst_r, c)
+            if src is not None and src.get("s") is not None:
+                dst.set("s", src.get("s"))
+    for r, c, f in formulas:                    # 2) สูตรที่คัดลอกจากแถวต้นแบบ
+        ce = get_cell(r, c)
+        reset(ce)
+        etree.SubElement(ce, _q("f")).text = f
+    for r, c, v in cells:                       # 3) ค่า (ไม่เขียนทับเซลล์ที่มีสูตร)
+        ce = get_cell(r, c)
+        if ce.find(_q("f")) is not None:
+            continue
+        reset(ce)
+        kind, text = _xml_value(v)
+        if kind == "n":
+            etree.SubElement(ce, _q("v")).text = text
+        elif kind == "b":
+            ce.set("t", "b")
+            etree.SubElement(ce, _q("v")).text = text
+        else:
+            ce.set("t", "inlineStr")
+            t = etree.SubElement(etree.SubElement(ce, _q("is")), _q("t"))
+            t.text = text
+            if text != text.strip():
+                t.set(f"{{{_XML_NS}}}space", "preserve")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _force_recalc(xml: bytes) -> bytes:
+    root = etree.fromstring(xml)
+    calc = root.find(_q("calcPr"))
+    if calc is None:
+        calc = etree.Element(_q("calcPr"))
+        anchor = None
+        for tag in ("sheets", "functionGroups", "externalReferences", "definedNames"):
+            e = root.find(_q(tag))
+            if e is not None:
+                anchor = e
+        if anchor is not None:
+            anchor.addnext(calc)
+        else:
+            root.append(calc)
+    calc.set("fullCalcOnLoad", "1")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def patch_xlsx(master: bytes, edits: dict, force_recalc: bool = True) -> bytes:
+    zin = zipfile.ZipFile(io.BytesIO(master))
+    try:
+        names = set(zin.namelist())
+        paths = _sheet_paths(zin)
+        new_parts: dict[str, bytes] = {}
+        for sheet, e in edits.items():
+            path = paths.get(norm_key(sheet))
+            if not path or path not in names:
+                raise ValueError(f"ไม่พบไฟล์ XML ของชีต {sheet}")
+            new_parts[path] = _patch_sheet(zin.read(path), e["cells"], e["formulas"], e["styles"])
+        if force_recalc:
+            new_parts["xl/workbook.xml"] = _force_recalc(zin.read("xl/workbook.xml"))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = new_parts.get(item.filename)
+                zout.writestr(item, data if data is not None else zin.read(item.filename))
+        return out.getvalue()
+    finally:
+        zin.close()
+
+
 def fill_workbook(master: bytes, reports: pd.DataFrame, parts: pd.DataFrame, expenses: pd.DataFrame,
                   ref: Optional[Reference], opts: dict) -> tuple[bytes, list[dict]]:
     log: list[dict] = []
-    wb = load_workbook(io.BytesIO(master))
+    REC.reset()
+    wb = load_workbook(io.BytesIO(master), keep_links=False)   # อ่านเพื่อหาตำแหน่งเท่านั้น ไม่ Save
     try:
-        wbv = load_workbook(io.BytesIO(master), data_only=True)
+        wbv = load_workbook(io.BytesIO(master), data_only=True, keep_links=False)
     except Exception:
         wbv = None
     sheets = {n: get_sheet(wb, n) for n in (SHEET_TMS, SHEET_SN, SHEET_EXP)}
@@ -1394,21 +1599,18 @@ def fill_workbook(master: bytes, reports: pd.DataFrame, parts: pd.DataFrame, exp
     n_sn = fill_sn(sheets[SHEET_SN], sn_rows, opts, log)
     hint = opts.get("month_override") or (min(days).replace(day=1) if days else None)
     n_exp = fill_expense(sheets[SHEET_EXP], vals[SHEET_EXP], expenses, hint, opts, log)
+    out = patch_xlsx(master, REC.edits(), opts.get("force_recalc", True))
     log.insert(0, {"sheet": "SUMMARY", "item": "cells written",
                    "result": f"TMS={n_tms}, SN={n_sn} (rows={len(sn_rows)}), Expense={n_exp}"})
-    try:
-        wb.calculation.fullCalcOnLoad = True  # make Excel recalc formulas on open
-    except Exception:
-        pass
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue(), log
+    return out, log
 
 
 # ----------------------------------------------------------------------------
 # Self test (python app.py --selftest)
 # ----------------------------------------------------------------------------
 def _demo_master() -> bytes:
+    from openpyxl.styles import Border, Side
+
     wb = Workbook()
     ws = wb.active
     ws.title = SHEET_TMS
@@ -1435,7 +1637,16 @@ def _demo_master() -> bytes:
                  9: "Error Description", 10: "Spare part code", 11: "Spare part Description", 12: "QTY",
                  13: "Unit", 14: "Consignment No.", 15: "Quotation No.", 21: "(every xx mths)"}.items():
         sn.cell(6, c, t)
-    sn["A7"] = "Mr. Suvanai"
+    # แถวข้อมูลเดิม (ต้นแบบ) + มีรูปแบบวันที่/เส้นขอบ + คอลัมน์ F เป็นสูตร
+    sn["A7"], sn["B7"], sn["C7"] = "Mr. Suvanai P.", datetime(2026, 9, 1), "Nipro Excellent Renal Care"
+    sn["D7"], sn["E7"] = "NCU-18", "17DG0362"
+    sn["F7"] = '=IF(E7="","",E7)'
+    sn["G7"], sn["H7"] = "PM", "PM"
+    sn["B7"].number_format = "dd-mmm-yy"
+    sn["B7"].border = Border(bottom=Side(style="thin"))
+    # ตารางสรุปที่อยู่ใต้ข้อมูล (เหลือแถวว่าง 8-10 เพียง 3 แถว)
+    sn["D11"], sn["E11"] = "Warranty", 20
+    sn["D12"], sn["E12"] = "Contract", 49
 
     ex = wb.create_sheet(SHEET_EXP)
     for c, t in {1: "Date", 2: "Description", 7: "Allowance", 10: "Petrol", 11: "Express way", 12: "Parking",
@@ -1518,23 +1729,48 @@ def run_selftest() -> None:
     val = validate_all(reports, parts, ref)
     assert (val["status"] == "OK").all(), val
     exp = build_expense_df(reports, load_expenses(), "ENG")
-    opts = {"staff": "Mr. Suvanai", "overwrite": False, "lang": "ENG", "fill_route": True, "month_override": None}
+    opts = {"staff": "Mr. Suvanai P.", "overwrite": False, "lang": "ENG", "fill_route": True,
+            "month_override": None, "force_recalc": True}
     out, log = fill_workbook(master, reports, parts, exp, ref, opts)
 
     wb = load_workbook(io.BytesIO(out))
     sn, tms, ex = wb[SHEET_SN], wb[SHEET_TMS], wb[SHEET_EXP]
-    assert sn["E7"].value == "21CX22513", sn["E7"].value
-    assert sn["G7"].value == "Urgent call (after 18.00)", sn["G7"].value
-    assert sn["H7"].value == "E97" and sn["I7"].value.startswith("SHORT CHEMICAL")
-    assert sn["J7"].value == "SP-0-504-232" and sn["K7"].value == "Clamp box"
-    assert sn["R7"].value == "CT-001" and sn["U7"].value == 3
+    # SN: เขียนต่อจากแถว 7 (แถวใหม่ = 8) ไม่ล้ำไปทับตารางสรุปที่แถว 11
+    assert sn["A7"].value == "Mr. Suvanai P." and sn["E7"].value == "17DG0362"
+    assert sn["A8"].value == "Mr. Suvanai P.", sn["A8"].value
+    assert sn["B8"].value == datetime(2026, 9, 7), sn["B8"].value
+    assert sn["B8"].number_format == "dd-mmm-yy", sn["B8"].number_format
+    assert sn["B8"].border.bottom.style == "thin"
+    assert sn["E8"].value == "21CX22513"
+    assert sn["F8"].value == '=IF(E8="","",E8)', sn["F8"].value   # คัดลอกสูตรจากแถวต้นแบบ
+    assert sn["G8"].value == "Service", sn["G8"].value
+    assert sn["H8"].value == "E97" and str(sn["I8"].value).startswith("SHORT CHEMICAL")
+    assert sn["J8"].value == "SP-0-504-232" and sn["K8"].value == "Clamp box"
+    assert sn["R8"].value == "CT-001" and sn["U8"].value == 3
+    assert sn["D11"].value == "Warranty" and sn["E11"].value == 20      # ตารางสรุปไม่ถูกทับ
+    assert sn["D12"].value == "Contract" and sn["E12"].value == 49
+    # TMS / Expense
     assert tms["R13"].value == "Rajthanee Hospital (Ayutthaya)", tms["R13"].value
     assert tms["S13"].value == 1 and tms["O13"].value == "Ayutthaya"
-    assert tms["V13"].value == dtime(18, 0)
+    assert abs(float(tms["V13"].value) - 0.75) < 1e-9, tms["V13"].value
     assert str(tms["A8"].value).startswith("="), "formula must be preserved"
     assert str(tms["X13"].value).startswith("="), "formula must be preserved"
     assert ex["B14"].value == "Rajthanee Hospital (Ayutthaya)", ex["B14"].value
     assert str(ex["P14"].value).startswith("=")
+    # ส่วนที่ไม่เกี่ยวข้องต้องเหมือนต้นฉบับทุกไบต์
+    zi, zo = zipfile.ZipFile(io.BytesIO(master)), zipfile.ZipFile(io.BytesIO(out))
+    assert zi.namelist() == zo.namelist()
+    untouched = _sheet_paths(zi)[norm_key(SHEET_ERR)]
+    assert zi.read(untouched) == zo.read(untouched)
+    assert b"fullCalcOnLoad" in zo.read("xl/workbook.xml")
+    # แถวว่างไม่พอ ต้องหยุดพร้อมข้อความ ไม่เขียนทับตารางสรุป
+    big = pd.concat([reports] * 4, ignore_index=True)
+    try:
+        fill_workbook(master, big, parts, exp, ref, opts)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("overflow was not detected")
     print("SELFTEST PASSED")
     for item in log:
         print(item)
@@ -1543,6 +1779,25 @@ def run_selftest() -> None:
 # ----------------------------------------------------------------------------
 # Streamlit UI
 # ----------------------------------------------------------------------------
+def _stretch(fn, *args, **kwargs):
+    """Full-width widget that works on both old and new Streamlit versions."""
+    try:
+        return fn(*args, width="stretch", **kwargs)
+    except Exception:
+        return fn(*args, use_container_width=True, **kwargs)
+
+
+def _only_options(df: pd.DataFrame, col: str, options: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    df[col] = df[col].apply(lambda v: norm_text(v) if norm_text(v) in options else None)
+    return df
+
+
+def _as_text_df(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows).astype(str)
+    return df.replace({"None": "", "nan": "", "NaT": ""})
+
+
 def _secret(name: str) -> str:
     try:
         return str(st.secrets.get(name, "")) or os.environ.get(name, "")
@@ -1591,10 +1846,12 @@ def sidebar() -> dict:
     model = sb.text_input("Model", value=DEFAULT_MODELS[provider], key=f"model_{provider}")
 
     sb.header("3) ตัวเลือก Export")
-    staff = sb.text_input("ชื่อผู้รับผิดชอบ (SN tracking)", value="Mr. Suvanai")
+    staff = sb.text_input("ชื่อผู้รับผิดชอบ (SN tracking)", value="Mr. Suvanai P.")
     lang = sb.radio("ภาษาชื่อ รพ. ใน TMS/Expense", ["ENG", "TH"], horizontal=True)
     overwrite = sb.checkbox("เขียนทับค่าที่มีอยู่แล้ว (ไม่แตะสูตร)", value=False)
     fill_route = sb.checkbox("เติมเส้นทาง BKK -> จังหวัด ใน TMS", value=True)
+    force_recalc = sb.checkbox("ให้ Excel คำนวณสูตรใหม่ทั้งไฟล์ตอนเปิด", value=True,
+                               help="ถ้าเปิดไฟล์แล้วเจอ Circular reference ให้ลองปิดตัวเลือกนี้แล้ว Export ใหม่")
     mo = sb.text_input("Month override (YYYY-MM) เว้นว่าง = อัตโนมัติ")
     month_override = None
     if mo.strip():
@@ -1603,7 +1860,8 @@ def sidebar() -> dict:
             sb.error("รูปแบบเดือนไม่ถูกต้อง ใช้ YYYY-MM")
         month_override = d
     return {"ref": ref, "provider": provider, "key": key, "model": model, "staff": staff, "lang": lang,
-            "overwrite": overwrite, "fill_route": fill_route, "month_override": month_override}
+            "overwrite": overwrite, "fill_route": fill_route, "month_override": month_override,
+            "force_recalc": force_recalc}
 
 
 def tab_upload(cfg: dict) -> None:
@@ -1631,7 +1889,7 @@ def tab_upload(cfg: dict) -> None:
     with st.expander("ประวัติการประมวลผล (cache)"):
         with db() as conn:
             hist = pd.read_sql_query("SELECT name, page, status, n_reports, processed_at FROM files ORDER BY processed_at DESC", conn)
-        st.dataframe(hist, use_container_width=True, hide_index=True)
+        _stretch(st.dataframe, hist, hide_index=True)
         ok = st.checkbox("ยืนยันล้างข้อมูลทั้งหมด")
         if st.button("ล้างข้อมูลที่เก็บไว้", disabled=not ok):
             clear_all()
@@ -1644,8 +1902,11 @@ def tab_review(cfg: dict) -> None:
     reports, parts = load_reports(), load_parts()
     st.subheader("1) รายงาน (Reports)")
     st.caption("แก้ไขได้ทุกช่อง เพิ่ม/ลบแถวได้ | วันที่รูปแบบ YYYY-MM-DD | เวลา HH:MM | Error code/Serial คั่นด้วย ,")
-    edited = st.data_editor(
-        reports, key=f"rep_{ver}", num_rows="dynamic", use_container_width=True, hide_index=True,
+    rview = _only_options(reports, "condition", CONDITION_OPTIONS)
+    rview = _only_options(rview, "service_kind", KIND_OPTIONS)
+    rview = _only_options(rview, "status_code", STATUS_OPTIONS)
+    edited = _stretch(
+        st.data_editor, rview, key=f"rep_{ver}", num_rows="dynamic", hide_index=True,
         column_config={
             "include": st.column_config.CheckboxColumn("ใช้", default=True),
             "rid": None, "page_key": None,
@@ -1666,37 +1927,41 @@ def tab_review(cfg: dict) -> None:
     for r in rep_now.to_dict("records"):
         labels[r["rid"]] = (f"{norm_text(r['rid'])[:8]} | {norm_text(r['date']) or '?'} | "
                             f"{(norm_text(r['hospital_eng']) or norm_text(r['customer']))[:30]} | {norm_text(r['serials'])[:30]}")
-    inv = {v: k for k, v in labels.items()}
-    pdisp = parts.copy()
-    pdisp.insert(0, "report", pdisp["rid"].map(labels))
-    pdisp = pdisp.drop(columns=["rid"])
-    pedit = st.data_editor(
-        pdisp, key=f"parts_{ver}", num_rows="dynamic", use_container_width=True, hide_index=True,
-        column_config={
-            "pid": None,
-            "report": st.column_config.SelectboxColumn("report", options=list(labels.values()), required=True),
-            "qty": st.column_config.NumberColumn("qty", min_value=0, step=1),
-        },
-    )
-    if st.button("บันทึก Parts"):
-        out = pedit.copy()
-        out["rid"] = out["report"].map(inv)
-        bad = out["rid"].isna().sum()
-        out = out[out["rid"].notna()].drop(columns=["report"])
-        out = assign_ids(ensure_cols(out, PART_COLS), "pid")
-        replace_table("parts", PART_COLS, out)
-        if bad:
-            st.warning(f"ตัดทิ้ง {bad} แถวที่ไม่ได้เลือก report")
-        st.session_state["ver"] = ver + 1
-        st.rerun()
+    if not labels:
+        st.info("ยังไม่มีรายงาน จึงยังเพิ่มอะไหล่ไม่ได้ (บันทึก Reports ก่อน)")
+    else:
+        inv = {v: k for k, v in labels.items()}
+        pdisp = parts.copy()
+        pdisp.insert(0, "report", pdisp["rid"].map(labels))
+        pdisp = pdisp.drop(columns=["rid"])
+        pedit = _stretch(
+            st.data_editor, pdisp, key=f"parts_{ver}", num_rows="dynamic", hide_index=True,
+            column_config={
+                "pid": None,
+                "report": st.column_config.SelectboxColumn("report", options=list(labels.values()), required=True),
+                "qty": st.column_config.NumberColumn("qty", min_value=0, step=1),
+            },
+        )
+        if st.button("บันทึก Parts"):
+            out = pedit.copy()
+            out["rid"] = out["report"].map(inv)
+            bad = int(out["rid"].isna().sum())
+            out = out[out["rid"].notna()].drop(columns=["report"])
+            out = assign_ids(ensure_cols(out, PART_COLS), "pid")
+            replace_table("parts", PART_COLS, out)
+            if bad:
+                st.warning(f"ตัดทิ้ง {bad} แถวที่ไม่ได้เลือก report")
+            st.session_state["ver"] = ver + 1
+            st.rerun()
 
     st.subheader("3) ค่าใช้จ่ายรายวัน (Expense Claim)")
     st.caption("กรอก Petrol / Express way / Parking / Other / Allowance เอง (รายงานไม่มีข้อมูลนี้)")
     exp = build_expense_df(rep_now, load_expenses(), cfg["lang"])
-    eedit = st.data_editor(
-        exp, key=f"exp_{ver}", num_rows="dynamic", use_container_width=True, hide_index=True,
+    exp = _only_options(exp, "service_type", SERVICE_TYPE_OPTIONS)
+    eedit = _stretch(
+        st.data_editor, exp, key=f"exp_{ver}", num_rows="dynamic", hide_index=True,
         column_config={
-            "service_type": st.column_config.SelectboxColumn("service_type", options=["Warranty", "PM Contract"]),
+            "service_type": st.column_config.SelectboxColumn("service_type", options=SERVICE_TYPE_OPTIONS),
             **{c: st.column_config.NumberColumn(c, min_value=0, format="%.2f") for c in EXP_NUM},
         },
     )
@@ -1732,7 +1997,7 @@ def tab_validate(cfg: dict) -> None:
         col.metric(s, int(counts.get(s, 0)))
     only_issue = st.checkbox("แสดงเฉพาะรายการที่มีปัญหา", value=True)
     view = val[val["status"] != "OK"] if only_issue else val
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    _stretch(st.dataframe, view, hide_index=True)
     if st.button("ปรับรหัสตามคำแนะนำอัตโนมัติ (Error code / Spare part)"):
         r2, p2, n = apply_suggestions(reports, parts, ref)
         save_reports(r2)
@@ -1746,21 +2011,22 @@ def tab_export(cfg: dict) -> None:
     st.subheader("ตัวอย่างข้อมูลที่จะเขียนลง Excel และดาวน์โหลด")
     reports, parts = load_reports(), load_parts()
     ref = cfg["ref"]
-    opts = {k: cfg[k] for k in ("staff", "lang", "overwrite", "fill_route", "month_override")}
+    opts = {k: cfg[k] for k in ("staff", "lang", "overwrite", "fill_route", "month_override", "force_recalc")}
     sn_rows = build_sn_rows(reports, parts, ref, opts)
     if not sn_rows:
         st.info("ยังไม่มีข้อมูลที่เลือกใช้ (include)")
         return
     st.markdown("**SN tracking form**")
-    st.dataframe(pd.DataFrame([{k: v for k, v in r.items()} for r in sn_rows]), use_container_width=True, hide_index=True)
+    _stretch(st.dataframe, _as_text_df(sn_rows), hide_index=True)
     days = aggregate_days(reports, cfg["lang"])
     st.markdown("**TMS Working Record (รายวัน)**")
-    st.dataframe(pd.DataFrame([
+    _stretch(st.dataframe, _as_text_df([
         {"date": d, "PM": " / ".join(a["pm"]), "PM qty": a["pm_q"], "Service": " / ".join(a["svc"]),
          "Service qty": a["svc_q"], "Installation": " / ".join(a["inst"]), "Inst qty": a["inst_q"],
          "Province": a["province"], "Start": fmt_time(a["start"]), "Finish": fmt_time(a["finish"])}
-        for d, a in sorted(days.items())]), use_container_width=True, hide_index=True)
-    st.caption("หมายเหตุ: openpyxl รักษาสูตร/จัดรูปแบบ/Data validation ได้ แต่รูปภาพ ชาร์ต หรือ Form control ในไฟล์ต้นฉบับอาจหายไป ควรเก็บไฟล์ต้นฉบับไว้")
+        for d, a in sorted(days.items())]) if days else pd.DataFrame(), hide_index=True)
+    st.caption("ไฟล์ที่ได้แก้เฉพาะ 3 ชีตโดยตรงที่ระดับ XML ส่วนอื่น (External link, รูปร่าง, ชีตอื่น) ไม่ถูกแตะ "
+               "ควรเก็บไฟล์ Master ต้นฉบับไว้เสมอ")
     if not MASTER_PATH.exists():
         st.warning("กรุณาอัปโหลด Master Excel ก่อน")
         return
@@ -1780,7 +2046,7 @@ def tab_export(cfg: dict) -> None:
         st.download_button("ดาวน์โหลด Excel", data=data, file_name=f"TMS_filled_{datetime.now():%Y%m%d_%H%M}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.markdown("**Log การเขียนไฟล์**")
-        st.dataframe(pd.DataFrame(log), use_container_width=True, hide_index=True)
+        _stretch(st.dataframe, pd.DataFrame(log).astype(str), hide_index=True)
 
 
 def main() -> None:
