@@ -815,11 +815,15 @@ class VisionClient:
         if not self.api_key:
             raise ValueError("ยังไม่ได้ใส่ API key ที่แถบด้านซ้าย")
         last: Optional[Exception] = None
-        for wait in (4, 15, 40, 0):
+        for wait in (5, 20, 0):
             try:
                 return parse_json_loose(self._call(jpeg))
             except Exception as e:
                 last = e
+                msg = str(e)
+                # key/model ผิด หรือโควตาหมด: ลองซ้ำไม่ช่วย หยุดทันทีเพื่อไม่เปลือง
+                if any(c in msg for c in ("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404", "HTTP 429")):
+                    break
                 if wait:
                     time.sleep(wait)
         raise RuntimeError(f"AI extraction failed: {last}")
