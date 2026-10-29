@@ -146,7 +146,7 @@ def parse_date(v: Any) -> Optional[date]:
             return None
         d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if y < 100:
-        y = y + 2500 - 543 if y >= 50 else y + 2000   # 69 -> BE 2569 -> 2026 ; 26 -> 2026
+        y = y + 2500 - 543 if y >= 50 else y + 2000
     elif y > 2400:
         y -= 543
     try:
@@ -170,7 +170,7 @@ def parse_json_loose(text: str) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Storage (so a browser refresh does not lose the work)
+# Storage
 # ----------------------------------------------------------------------------
 def load_store() -> dict:
     try:
@@ -204,7 +204,7 @@ def df_to_rows(df: pd.DataFrame) -> list[dict]:
 
 
 # ----------------------------------------------------------------------------
-# Page rendering (PDF / images -> JPEG, optionally only the top part)
+# Page rendering
 # ----------------------------------------------------------------------------
 def _to_jpeg(img: Image.Image, crop: float = 1.0) -> bytes:
     img = ImageOps.exif_transpose(img).convert("RGB")
@@ -268,7 +268,7 @@ def render_page(name: str, data: bytes, page_no: int, crop: float = 1.0) -> byte
 # AI client
 # ----------------------------------------------------------------------------
 class AiFatal(Exception):
-    """Retrying will not help (bad key / model / quota)."""
+    pass
 
 
 class AiQuota(AiFatal):
@@ -305,7 +305,7 @@ class VisionClient:
             except AiQuota:
                 if quota_retry:
                     quota_retry -= 1
-                    time.sleep(30)          # a per-minute limit may clear; a daily limit will fail again
+                    time.sleep(30)
                     continue
                 raise
             except AiFatal:
@@ -373,7 +373,7 @@ def reports_to_rows(raw: Any, source: str, page: int) -> list[dict]:
         rows.append({"serial": serial, "date": d.isoformat() if d else raw_d,
                      "customer": _s(it.get("customer_name")), "form": form,
                      "source": source, "page": str(page)})
-    if not rows:   # blank / unreadable page -> visible placeholder row so nothing is silently lost
+    if not rows:
         rows.append({"serial": "", "date": "", "customer": "", "form": "", "source": source, "page": str(page)})
     return rows
 
@@ -382,7 +382,7 @@ def read_page(client: VisionClient, jpeg: bytes, name: str, data: bytes, page_no
     new = reports_to_rows(client.extract(jpeg), name, page_no)
     if client.pause:
         time.sleep(client.pause)
-    if crop < 1 and not any(r["serial"] for r in new):      # nothing found in the top part -> try the whole page
+    if crop < 1 and not any(r["serial"] for r in new):
         try:
             full = render_page(name, data, page_no, 1.0)
             new2 = reports_to_rows(client.extract(full), name, page_no)
@@ -429,7 +429,7 @@ def process_files(files: list[tuple[str, bytes]], client: VisionClient, rows: li
                     res["errors"].append(f"{name} หน้า {page_no}: {str(e)[:200]}")
                     fails += 1
                     if fails >= 3:
-                        res["stopped"] = "AI ตอบผิดพลาดติดกัน 3 หน้า (อาจเป็นเซิร์ฟเวอร์ Google คนใช้เยอะ ลองใหม่ภายหลัง)"
+                        res["stopped"] = "AI ตอบผิดพลาดติดกัน 3 หน้า"
                         return res
                     continue
                 fails = 0
@@ -444,7 +444,7 @@ def process_files(files: list[tuple[str, bytes]], client: VisionClient, rows: li
 
 
 # ----------------------------------------------------------------------------
-# Reference check against the Data2 sheet of the uploaded workbook
+# Reference check
 # ----------------------------------------------------------------------------
 def ref_serials_impl(data: bytes) -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -490,7 +490,7 @@ def check_serial(s: str, ref: dict, ref_keys: list[str]) -> tuple[str, str]:
 
 
 # ----------------------------------------------------------------------------
-# Locate the Serial number / Date / Service type columns in the template
+# Template Analysis
 # ----------------------------------------------------------------------------
 def _has_style(c) -> bool:
     try:
@@ -582,7 +582,7 @@ def plan_template_impl(data: bytes) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# XML-level patching (keeps formulas, styles, drop downs, links, shapes of the original file)
+# XML-level patching
 # ----------------------------------------------------------------------------
 _NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _RNS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -601,7 +601,6 @@ def _q(tag: str) -> str:
 
 
 class DateCell:
-    """A real Excel date (serial number) to write into a cell."""
     __slots__ = ("serial",)
 
     def __init__(self, serial: float) -> None:
@@ -609,8 +608,6 @@ class DateCell:
 
 
 class StyleBook:
-    """Gives a date number format to a cell style without touching its fill / border / font."""
-
     def __init__(self, xml: bytes) -> None:
         self.root = etree.fromstring(xml)
         self.xfs = self.root.find(_q("cellXfs"))
@@ -669,8 +666,6 @@ class StyleBook:
 
 
 def shift_formula(f: str, host_is_target: bool, names: set, at: int, n: int, ext: bool = True) -> str:
-    """Shift row numbers >= at by n for references pointing at the target sheet.
-    ext=True also extends the END of a range that stops at row at-1."""
     def sh(num: str, lim: int) -> str:
         v = int(num)
         return str(v + n) if v >= lim else num
@@ -729,7 +724,6 @@ def _shift_structs(root, at: int, n: int) -> None:
 
 
 def _insert_rows(root, at: int, n: int, src_row: int) -> None:
-    """Insert n rows at row `at`, copying style and formulas from src_row (= at-1)."""
     sd = root.find(_q("sheetData"))
     src_el = None
     for row in sd.findall(_q("row")):
@@ -860,7 +854,7 @@ def _patch_root(root, cells: list, styles: Optional[StyleBook] = None) -> None:
     for r, c, v in cells:
         ce = get_cell(r, c)
         if ce.find(_q("f")) is not None:
-            continue                                   # never overwrite a formula
+            continue
         for ch in list(ce):
             ce.remove(ch)
         ce.attrib.pop("t", None)
@@ -950,7 +944,7 @@ def patch_xlsx(master: bytes, cells_by_sheet: dict, ins_by_sheet: dict, wb) -> b
         if styles is not None:
             out_parts["xl/styles.xml"] = _tostring(styles.root)
 
-        calc = wbroot.find(_q("calcPr"))          # make Excel recalculate every formula on open
+        calc = wbroot.find(_q("calcPr"))
         if calc is None:
             calc = etree.Element(_q("calcPr"))
             anchor = None
@@ -966,7 +960,7 @@ def patch_xlsx(master: bytes, cells_by_sheet: dict, ins_by_sheet: dict, wb) -> b
         out_parts["xl/workbook.xml"] = _tostring(wbroot)
 
         drop: set[str] = set()
-        if "xl/calcChain.xml" in names:            # stale after edits; Excel rebuilds it
+        if "xl/calcChain.xml" in names:
             drop.add("xl/calcChain.xml")
             ct = etree.fromstring(zin.read("[Content_Types].xml"))
             for el in list(ct):
@@ -992,19 +986,19 @@ def patch_xlsx(master: bytes, cells_by_sheet: dict, ins_by_sheet: dict, wb) -> b
 
 
 def build_xlsx(template: bytes, rows: list[dict]) -> tuple[bytes, dict]:
-    """rows: dicts with serial / date (ISO or parsable) / form (Service|PM). Rows without serial are skipped."""
     rows = [r for r in rows if clean_serial(r.get("serial"))]
-    wb = load_workbook(io.BytesIO(template), keep_links=False)      # read only, never saved
+    wb = load_workbook(io.BytesIO(template), keep_links=False)
     try:
         plan = analyse_sheet(wb)
-        if not plan["ok"]:
-            raise ValueError(plan["error"])
+        if not plan.get("ok"):
+            raise ValueError(plan.get("error", "วิเคราะห์ไฟล์ไม่สำเร็จ"))
         base = date(1904, 1, 1) if getattr(getattr(wb, "epoch", None), "year", 1900) == 1904 else date(1899, 12, 30)
         n = len(rows)
         ins: dict = {}
         inserted = 0
-        if plan["free"] is not None and n > plan["free"]:
-            inserted = n - plan["free"]
+        free = plan.get("free")
+        if free is not None and n > free:
+            inserted = n - free
             ins[plan["title"]] = {plan["src"]: inserted}
         cells: list = []
         n_date = n_type = 0
@@ -1012,10 +1006,10 @@ def build_xlsx(template: bytes, rows: list[dict]) -> tuple[bytes, dict]:
             rn = plan["start"] + i
             cells.append((rn, plan["col"], clean_serial(r.get("serial"))))
             d = parse_date(r.get("date"))
-            if d and plan["date_col"]:
+            if d and plan.get("date_col"):
                 cells.append((rn, plan["date_col"], DateCell((d - base).days)))
                 n_date += 1
-            if r.get("form") in FORM_OPTIONS and plan["type_col"]:
+            if r.get("form") in FORM_OPTIONS and plan.get("type_col"):
                 cells.append((rn, plan["type_col"], r["form"]))
                 n_type += 1
         out = patch_xlsx(template, {plan["title"]: cells} if cells else {}, ins, wb)
@@ -1023,7 +1017,7 @@ def build_xlsx(template: bytes, rows: list[dict]) -> tuple[bytes, dict]:
         wb.close()
     return out, {"first_row": plan["start"], "last_row": plan["start"] + max(n, 1) - 1, "col": plan["col_letter"],
                  "inserted": inserted, "count": n, "dates": n_date, "types": n_type,
-                 "no_summary": plan["stop"] is None}
+                 "no_summary": plan.get("stop") is None}
 
 
 # ----------------------------------------------------------------------------
@@ -1111,12 +1105,10 @@ def run_selftest() -> None:
     assert "$E11" in sn["C11"].value and "$E12" in sn["C12"].value and "$E7" in sn["C7"].value
     assert sn["E11"].fill.fill_type == "solid" and sn["E12"].fill.fill_type == "solid"
     dvs = sn.data_validations.dataValidation
-    assert len(dvs) == 1 and str(dvs[0].sqref) == "G7:G12" and "Service" in dvs[0].formula1, [str(d.sqref) for d in dvs]
-    # fewer serials than free rows: no insertion
+    assert len(dvs) == 1 and str(dvs[0].sqref) == "G7:G12" and "Service" in dvs[0].formula1
     out2, info2 = build_xlsx(tpl, data[:3])
     assert info2["inserted"] == 0
     assert load_workbook(io.BytesIO(out2))[SHEET_SN]["E14"].value is None
-    # template whose Date cells are "General": app gives them a date format
     out3, _ = build_xlsx(_demo_template("General"), data)
     sn3 = load_workbook(io.BytesIO(out3))[SHEET_SN]
     assert sn3["B7"].value == datetime(2026, 8, 6) and is_date_format(sn3["B7"].number_format)
@@ -1150,10 +1142,10 @@ def _secret(*names: str) -> str:
 def ref_serials_v3(data: bytes) -> dict:
     return ref_serials_impl(data)
 
+
 @st.cache_data(show_spinner=False)
 def plan_template_v3(data: bytes) -> dict:
     return plan_template_impl(data)
-
 
 
 def sidebar() -> dict:
@@ -1215,25 +1207,24 @@ def main() -> None:
     if template is None:
         st.info("ยังไม่มีไฟล์ Blank")
     else:
-                plan = plan_template_v3(template)
-        if not plan["ok"]:
-            st.error(plan["error"])
+        plan = plan_template_v3(template)
+        if not plan.get("ok"):
+            st.error(plan.get("error", "วิเคราะห์ไฟล์ไม่สำเร็จ"))
         else:
-            msg = (f"พบชีต **{plan['title']}** | Serial number = คอลัมน์ **{plan['col_letter']}** | "
-              f"Date = **{plan.get('date_letter') or 'ไม่พบ'}** | "
-              f"Service type = **{plan.get('type_letter') or 'ไม่พบ'}** | "
-              f"เริ่มลงที่แถว **{plan['start']}**")
-
-            if plan["free"] is not None:
+            msg = (f"พบชีต **{plan.get('title')}** | Serial number = คอลัมน์ **{plan.get('col_letter')}** | "
+                   f"Date = **{plan.get('date_letter') or 'ไม่พบ'}** | "
+                   f"Service type = **{plan.get('type_letter') or 'ไม่พบ'}** | "
+                   f"เริ่มลงที่แถว **{plan.get('start')}**")
+            if plan.get("free") is not None:
                 msg += f" | ช่องว่างที่เหลือ {plan['free']} ช่อง (ถ้าไม่พอจะแทรกแถวให้อัตโนมัติ)"
             st.success(msg)
-            if not plan["date_col"]:
+            if not plan.get("date_col"):
                 st.warning("ไม่พบหัวคอลัมน์ 'Date' จะไม่ลงวันที่")
-            if not plan["type_col"]:
+            if not plan.get("type_col"):
                 st.warning("ไม่พบหัวคอลัมน์ 'Service type' จะไม่ลงชนิดงาน")
-            if plan["existing"]:
+            if plan.get("existing"):
                 st.warning(f"ในไฟล์มี Serial อยู่แล้ว {plan['existing']} แถว ข้อมูลใหม่จะต่อท้ายจากแถวสุดท้าย")
-            if plan["stop"] is None:
+            if plan.get("stop") is None:
                 st.warning("ไม่พบตารางสรุป (Warranty / Contract) ท้ายชีต จะไม่แทรกแถวให้ ถ้าเลขเกินช่องที่จัดรูปแบบไว้ "
                            "แถวส่วนเกินจะไม่มีสี/เส้นตาราง")
 
@@ -1259,8 +1250,7 @@ def main() -> None:
             save_store(rows, done)
         errs = list(res["errors"])
         if res["stopped"]:
-            errs.append("หยุดอ่านระหว่างทาง: " + res["stopped"] +
-                        " (หน้าที่อ่านเสร็จแล้วถูกเก็บไว้ กดอ่านใหม่ภายหลังเพื่ออ่านต่อ)")
+            errs.append("หยุดอ่านระหว่างทาง: " + res["stopped"] + " (หน้าที่อ่านเสร็จแล้วถูกเก็บไว้)")
         ss.last_msg = f"อ่านแล้ว {res['pages']} หน้า ได้ {res['added']} แถว ข้ามหน้าที่เคยอ่าน {res['skipped']} หน้า"
         ss.last_errors = errs
         ss.ver += 1
@@ -1270,8 +1260,7 @@ def main() -> None:
 
     # ---- Step 3 -----------------------------------------------------------
     st.header("3) ตรวจและแก้ไขข้อมูล")
-    st.caption("แก้ในตารางได้โดยตรง เพิ่มแถวที่ท้ายตาราง หรือเลือกแถวแล้วกด Delete เพื่อลบ "
-               "วันที่พิมพ์เป็น YYYY-MM-DD หรือ วัน/เดือน/ปี ก็ได้ ลำดับแถวในตารางคือลำดับที่จะลงใน Excel")
+    st.caption("แก้ในตารางได้โดยตรง เพิ่มแถวที่ท้ายตาราง หรือเลือกแถวแล้วกด Delete เพื่อลบ")
     df = pd.DataFrame(ss.rows, columns=COLS)
     df = df.astype(object).where(df.notna(), None)
     df["form"] = df["form"].apply(lambda v: v if v in FORM_OPTIONS else None)
@@ -1304,11 +1293,11 @@ def main() -> None:
     if q:
         st.warning(f"มี {q} แถวที่มีเครื่องหมาย ? (ตัวอักษรที่ AI อ่านไม่ออก) กรุณาแก้ในตาราง")
     if n_bad_date:
-        st.warning(f"มี {n_bad_date} แถวที่วันที่ว่างหรืออ่านไม่ได้ แถวเหล่านี้จะไม่ลงวันที่ใน Excel (กรอกในตารางได้)")
+        st.warning(f"มี {n_bad_date} แถวที่วันที่ว่างหรืออ่านไม่ได้ แถวเหล่านี้จะไม่ลงวันที่ใน Excel")
     if n_no_form:
         st.info(f"มี {n_no_form} แถวที่ไม่ได้ระบุชนิดใบงาน ช่อง Service type ใน Excel จะเว้นว่างให้เลือกเอง")
     if dup:
-        st.info("Serial ซ้ำ: " + ", ".join(dup[:15]) + " (ปกติถ้าเครื่องเดียวมีทั้งใบ Service และ PM)")
+        st.info("Serial ซ้ำ: " + ", ".join(dup[:15]))
     if ref and live:
         with st.expander("เทียบกับ Data2 (ชื่อ รพ. ที่อ่านได้ กับชื่อใน Data2 ตาม Serial)", expanded=bool(bad)):
             table = []
@@ -1345,9 +1334,11 @@ def main() -> None:
     # ---- Step 4 -----------------------------------------------------------
     st.header("4) Export")
     if plan and plan.get("ok"):
-        need = max(len(with_serial) - plan["free"], 0) if plan["free"] is not None else 0
-        st.caption(f"จะลง {len(with_serial)} แถว: Serial ที่ช่อง {plan['col_letter']}{plan['start']} เป็นต้นไป"
-                   f" | Date ที่คอลัมน์ {plan['date_letter'] or '-'} | Service type ที่คอลัมน์ {plan['type_letter'] or '-'}"
+        free = plan.get("free")
+        need = max(len(with_serial) - free, 0) if free is not None else 0
+        st.caption(f"จะลง {len(with_serial)} แถว: Serial ที่ช่อง {plan.get('col_letter')}{plan.get('start')} เป็นต้นไป"
+                   f" | Date ที่คอลัมน์ {plan.get('date_letter') or '-'}"
+                   f" | Service type ที่คอลัมน์ {plan.get('type_letter') or '-'}"
                    + (f" | แทรกแถวเพิ่ม {need} แถว" if need else ""))
     if st.button("สร้างไฟล์ Excel", type="primary", disabled=template is None or not with_serial):
         try:
