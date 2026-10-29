@@ -1147,13 +1147,13 @@ def _secret(*names: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def ref_serials(data: bytes) -> dict:
+def ref_serials_v3(data: bytes) -> dict:
     return ref_serials_impl(data)
 
-
 @st.cache_data(show_spinner=False)
-def plan_template(data: bytes) -> dict:
+def plan_template_v3(data: bytes) -> dict:
     return plan_template_impl(data)
+
 
 
 def sidebar() -> dict:
@@ -1215,13 +1215,15 @@ def main() -> None:
     if template is None:
         st.info("ยังไม่มีไฟล์ Blank")
     else:
-        plan = plan_template(template)
+                plan = plan_template_v3(template)
         if not plan["ok"]:
             st.error(plan["error"])
         else:
             msg = (f"พบชีต **{plan['title']}** | Serial number = คอลัมน์ **{plan['col_letter']}** | "
-                   f"Date = **{plan['date_letter'] or 'ไม่พบ'}** | Service type = **{plan['type_letter'] or 'ไม่พบ'}** | "
-                   f"เริ่มลงที่แถว **{plan['start']}**")
+              f"Date = **{plan.get('date_letter') or 'ไม่พบ'}** | "
+              f"Service type = **{plan.get('type_letter') or 'ไม่พบ'}** | "
+              f"เริ่มลงที่แถว **{plan['start']}**")
+
             if plan["free"] is not None:
                 msg += f" | ช่องว่างที่เหลือ {plan['free']} ช่อง (ถ้าไม่พอจะแทรกแถวให้อัตโนมัติ)"
             st.success(msg)
@@ -1288,7 +1290,7 @@ def main() -> None:
     ss.live = live
     save_store(live, ss.done)
 
-    ref = ref_serials(template) if template else {}
+    ref = ref_serials_v3(template) if template else {}
     ref_keys = list(ref)
     results = [check_serial(r["serial"], ref, ref_keys) for r in live]
     n_ok = sum(1 for s, _ in results if s == "พบ")
